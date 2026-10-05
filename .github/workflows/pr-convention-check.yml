@@ -1,0 +1,111 @@
+name: PR Governance Check
+
+on:
+	pull_request:
+		types:
+			- opened
+			- edited
+			- synchronize
+			- labeled
+			- unlabeled
+		branches:
+			- dev
+			- stage
+			- main
+
+permissions:
+	contents: read
+	pull-requests: read
+
+jobs:
+	validate-pr:
+		name: Validate Pull Request Governance
+		runs-on: ubuntu-latest
+		steps:
+			- name: Check PR title
+				uses: amannn/action-semantic-pull-request@v6
+				env:
+					GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+				with:
+					types: |
+						feat
+						fix
+						chore
+						docs
+						refactor
+						test
+						build
+						ci
+						perf
+						revert
+
+			- name: Checkout repository
+				uses: actions/checkout@v4
+				with:
+					fetch-depth: 0
+
+			- name: Check branch synchronization
+				env:
+					BASE_SHA: ${{ github.event.pull_request.base.sha }}
+					HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+				run: |
+					set -e
+					if git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
+						echo "Source branch contains the latest target branch."
+					else
+						echo "::error::Source branch is out of sync with the target branch."
+						exit 1
+					fi
+
+			- name: Check merge conflicts
+				env:
+					GH_TOKEN: ${{ github.token }}
+					REPOSITORY: ${{ github.repository }}
+					PR_NUMBER: ${{ github.event.pull_request.number }}
+				run: |
+					set -e
+					for attempt in {1..5}; do
+						MERGEABLE=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.mergeable')
+						echo "GitHub mergeable state: $MERGEABLE"
+
+						if [ "$MERGEABLE" = "true" ]; then
+							echo "Pull request has no merge conflicts."
+							exit 0
+						fi
+
+						if [ "$MERGEABLE" = "false" ]; then
+							echo "::error::Pull request contains merge conflicts."
+							exit 1
+						fi
+
+						echo "Waiting for GitHub to calculate mergeability..."
+						sleep 5
+					done
+
+					echo "::error::Unable to determine PR mergeability."
+					exit 1
+
+			- name: Check protected files
+				env:
+					BASE_SHA: ${{ github.event.pull_request.base.sha }}
+					HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+					PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+				run: |
+					set -e
+					PROTECTED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -E '^\.github/workflows/|^package(-lock)?\.json$' || true)
+
+					if [ -z "$PROTECTED_FILES" ]; then
+						echo "No protected files were modified."
+						exit 0
+					fi
+
+					echo "Protected files modified:"
+					echo "$PROTECTED_FILES"
+
+					if [[ ",$PR_LABELS," == *",infra-approved,"* ]]; then
+						echo "infra-approved label detected."
+						exit 0
+					fi
+
+					echo "::error::Protected files require the 'infra-approved' label."
+					exit 1
